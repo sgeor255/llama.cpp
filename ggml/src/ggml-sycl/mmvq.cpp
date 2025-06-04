@@ -57,6 +57,54 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __r
     }
 }
 
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_reorder_local_mem(const void * __restrict__ vx, const void * __restrict__ vy, sycl::local_accessor<block_q8_1, 1> vy_local, float * __restrict__ dst,
+                                  const int ncols, const int nrows, const sycl::nd_item<3> & nd_item) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    const auto sg           = nd_item.get_sub_group();
+    const int  sg_range     = sg.get_group_linear_range();
+    const int  workgroup_id = nd_item.get_group_linear_id();
+    const int  sg_id        = sg.get_group_linear_id();
+    const int  row          = workgroup_id * sg_range + sg_id;
+
+    if (row >= nrows) return;
+
+    const int blocks_per_row            = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup   = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_sg = block_traits::qi / block_traits::vdr_mmvq;
+
+    const int total_y_blocks = blocks_per_row * block_type::block_to_q8_1_ratio();
+    const int nblocks        = nrows * blocks_per_row;
+
+    const block_q8_1 * y_global = static_cast<const block_q8_1 *>(vy);
+    for (int i = nd_item.get_local_linear_id(); i < total_y_blocks; i += nd_item.get_local_range().size()) {
+        vy_local[i] = y_global[i];
+    }
+    nd_item.barrier(sycl::access::fence_space::local_space);
+
+    float partial_sum = 0.0f;
+    for (int i = sg.get_local_linear_id() / block_elements_per_sg; i < blocks_per_row; i += blocks_per_subgroup) {
+        const int ibx       = row * blocks_per_row + i;
+        const int bx_offset = block_type::get_block_offset(ibx);
+        const int d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+
+        const int iby = i * block_type::block_to_q8_1_ratio();
+
+        for (int elem = 0; elem < block_elements_per_sg; elem += WARP_SIZE) {
+            const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_sg);
+            partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, &vy_local[iby], iqs, nblocks);
+        }
+    }
+
+    float sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
+
+    if (sg.leader()) {
+        dst[row] = sum;
+    }
+}
+
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
 static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
                           const int ncols, const int nrows, const sycl::nd_item<3> & item_ct1) {
@@ -87,6 +135,58 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
                                           (qi / vdr));  // x block quant index when casting the quants to int
 
             tmp += vec_dot_q_sycl(&x[ibx], &y[iby], iqs);
+        }
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        tmp += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
+static void mul_mat_vec_q_local_mem(const void * __restrict__ vx, const void * __restrict__ vy, sycl::local_accessor<block_q8_1, 1> y_local, float * __restrict__ dst,
+                          const int ncols, const int nrows, const sycl::nd_item<3> & item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int     blocks_per_row  = ncols / qk;
+    constexpr int blocks_per_warp = (vdr * WARP_SIZE + qi - 1) / qi;  // Ensuring blocks_per_warp > 0
+
+    assert(blocks_per_warp > 0);
+
+    // partial sum for each thread
+    float tmp = 0.0f;
+
+    const block_q_t *  x = (const block_q_t *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_y = ncols / /* qk_vec */ QK8_1; // TODO:: hardcoded
+    const int total_y_blocks = blocks_per_row_y;
+    for (int iby = item_ct1.get_local_id(2); iby < total_y_blocks; iby += item_ct1.get_local_range(2)) {
+        y_local[iby] = y[iby];
+    }
+    
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row * blocks_per_row + i;  // x block index
+
+        const int iby = i * (qk / QK8_1);          // y block index that aligns with ibx
+
+        for (size_t elem = 0; elem < qi / vdr; elem += WARP_SIZE) {
+            const int iqs = elem + vdr * (item_ct1.get_local_id(2) %
+                                          (qi / vdr));  // x block quant index when casting the quants to int
+
+            tmp += vec_dot_q_sycl(&x[ibx], &y_local[iby], iqs);
         }
     }
 
@@ -720,21 +820,32 @@ static void mul_mat_vec_q4_K_q8_1_sycl(const void *vx, const void *vy,
                                        float *dst, const int ncols,
                                        const int nrows,
                                        dpct::queue_ptr stream) {
+    // std::cout << ">>>>>>>>> THIS IS CALLED\n";
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+
+    using block_type = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q4_K>;
+    const int blocks_per_row = ncols / block_type::traits::qk;
+    const int total_y_blocks = blocks_per_row * block_type::block_to_q8_1_ratio();
+    if(total_y_blocks * sizeof(block_q8_1) > stream->get_device().get_info<sycl::info::device::local_mem_size>()) {
+        // TODO: add fallback
+        GGML_ABORT("not enough local mem");
+    }
+
     {
 
         stream->submit([&](sycl::handler &cgh) {
+            sycl::local_accessor<block_q8_1, 1> vy_local(sycl::range<1>(total_y_blocks), cgh);
 
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                        mul_mat_vec_q<QK_K, QI4_K, block_q4_K,
+                        mul_mat_vec_q_local_mem<QK_K, QI4_K, block_q4_K,
                                       VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(
-                            vx, vy, dst, ncols, nrows, item_ct1);
+                            vx, vy, vy_local, dst, ncols, nrows, item_ct1);
                     });
         });
     }
@@ -742,19 +853,32 @@ static void mul_mat_vec_q4_K_q8_1_sycl(const void *vx, const void *vy,
 
 static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
     const int nrows, dpct::queue_ptr stream) {
+    // std::cout << ">>>>>>>>> REORDER PATH\n";
+
     GGML_ASSERT(ncols % QK_K == 0);
 
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
     GGML_ASSERT(block_num_y % num_subgroups == 0);
+    // std::cout << "block_num_y: " << block_num_y << ", num_subgroups: " << num_subgroups << ", nrows: " << nrows << ", ncols:" << ncols << "\n";
 
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
+    using block_type = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q4_K>;
+    const int blocks_per_row = ncols / block_type::traits::qk;
+    const int total_y_blocks = blocks_per_row * block_type::block_to_q8_1_ratio();
+    if(total_y_blocks * sizeof(block_q8_1) > stream->get_device().get_info<sycl::info::device::local_mem_size>()) {
+        // TODO: add fallback
+        GGML_ABORT("not enough local mem");
+    }
+
     stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<block_q8_1, 1> vy_local(sycl::range<1>(total_y_blocks), cgh);
+
         cgh.parallel_for(sycl::nd_range<3>(global_size, workgroup_size),
                             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(vx, vy, dst, ncols,
+                                mul_mat_vec_q_reorder_local_mem<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(vx, vy, vy_local, dst, ncols,
                                                                                             nrows, nd_item);
                             });
     });
